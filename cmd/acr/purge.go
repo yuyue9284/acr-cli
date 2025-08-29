@@ -88,10 +88,11 @@ type purgeParameters struct {
 	includeLocked     bool
 	concurrency       int
 	repoPageSize      int32
-	candidateDigests  []string
 	deniedTags        []string
 	candidateListFile string
 	deniedListFile    string
+	// Repository-aware candidate digest mapping
+	repoDigestMap map[string]map[string]struct{}
 	// Backup-related parameters
 	disableBackup        bool
 	backupRegistryName   string
@@ -131,22 +132,25 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 			if purgeParams.candidateListFile == "" || purgeParams.deniedListFile == "" {
 				return errors.New("both --candidate-digests and --denied-tags must be provided")
 			}
-			candidates, err := loadCSVValues(purgeParams.candidateListFile)
+
+			// Load repo-digest mapping for repository-aware filtering
+			repoDigestMap, err := loadRepoDigestMapping(purgeParams.candidateListFile)
 			if err != nil {
 				return fmt.Errorf("failed reading candidate-digests CSV: %w", err)
 			}
-			if len(candidates) == 0 {
+			if len(repoDigestMap) == 0 {
 				return errors.New("candidate-digests file is empty; aborting purge for safety")
 			}
-			denied, err := loadCSVValues(purgeParams.deniedListFile)
+			purgeParams.repoDigestMap = repoDigestMap
+
+			deniedTags, err := loadCSVValues(purgeParams.deniedListFile)
 			if err != nil {
 				return fmt.Errorf("failed reading denied-tags CSV: %w", err)
 			}
-			if len(denied) == 0 {
+			if len(deniedTags) == 0 {
 				return errors.New("denied-tags file is empty; aborting purge for safety")
 			}
-			purgeParams.candidateDigests = candidates
-			purgeParams.deniedTags = denied
+			purgeParams.deniedTags = deniedTags
 
 			// Validate backup parameters if backup is enabled (not disabled)
 			if !purgeParams.disableBackup {
@@ -183,7 +187,7 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 				fmt.Printf("Specified concurrency value too large. Set to maximum value: %d \n", maxPoolSize)
 			}
 
-			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked, purgeParams.candidateDigests, purgeParams.deniedTags, !purgeParams.disableBackup, purgeParams.backupRegistryName, purgeParams.backupSubscriptionID, purgeParams.backupResourceGroup, purgeParams.sourceSubscriptionID, purgeParams.sourceResourceGroup)
+			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked, purgeParams.repoDigestMap, purgeParams.deniedTags, !purgeParams.disableBackup, purgeParams.backupRegistryName, purgeParams.backupSubscriptionID, purgeParams.backupResourceGroup, purgeParams.sourceSubscriptionID, purgeParams.sourceResourceGroup)
 
 			if err != nil {
 				fmt.Printf("Failed to complete purge: %v \n", err)
@@ -212,7 +216,7 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 	cmd.Flags().Int64Var(&purgeParams.filterTimeout, "filter-timeout-seconds", defaultRegexpMatchTimeoutSeconds, "This limits the evaluation of the regex filter, and will return a timeout error if this duration is exceeded during a single evaluation. If written incorrectly a regexp filter with backtracking can result in an infinite loop.")
 	cmd.Flags().IntVar(&purgeParams.concurrency, "concurrency", defaultPoolSize, concurrencyDescription)
 	cmd.Flags().Int32Var(&purgeParams.repoPageSize, "repository-page-size", defaultRepoPageSize, repoPageSizeDescription)
-	cmd.Flags().StringVar(&purgeParams.candidateListFile, "candidate-digests", "", "REQUIRED. Path to CSV file listing manifest digests considered for deletion (candidate digest list). A tag whose digest is absent will NOT be deleted.")
+	cmd.Flags().StringVar(&purgeParams.candidateListFile, "candidate-digests", "", "REQUIRED. Path to CSV file with repo,digest format listing manifest digests considered for deletion per repository. A tag whose digest is absent will NOT be deleted.")
 	cmd.Flags().StringVar(&purgeParams.deniedListFile, "denied-tags", "", "REQUIRED. Path to CSV file listing tag names that must never be deleted (denied tag list). One or more tag names per line or comma-separated; lines starting with # ignored.")
 	// Backup flags
 	cmd.Flags().BoolVar(&purgeParams.disableBackup, "disable-backup", false, "Disable backup of tags to another Azure Container Registry before deletion (backup is enabled by default)")
@@ -240,7 +244,7 @@ func purge(ctx context.Context,
 	tagFilters map[string]string,
 	dryRun bool,
 	includeLocked bool,
-	candidateDigests []string,
+	repoDigestMap map[string]map[string]struct{},
 	deniedTags []string,
 	enableBackup bool,
 	backupRegistryName string,
@@ -249,11 +253,7 @@ func purge(ctx context.Context,
 	sourceSubscriptionID string,
 	sourceResourceGroup string) (deletedTagsCount int, deletedManifestsCount int, err error) {
 
-	// Pre-build lookup sets for efficiency
-	candidateDigestSet := make(map[string]struct{})
-	for _, digest := range candidateDigests {
-		candidateDigestSet[strings.ToLower(strings.TrimSpace(digest))] = struct{}{}
-	}
+	// Build denied tag set for efficiency
 	deniedTagSet := make(map[string]struct{})
 	for _, tag := range deniedTags {
 		deniedTagSet[tag] = struct{}{}
@@ -261,6 +261,15 @@ func purge(ctx context.Context,
 
 	// In order to print a summary of the deleted tags/manifests the counters get updated everytime a repo is purged.
 	for repoName, tagRegex := range tagFilters {
+		// Get candidate digests for this specific repository
+		candidateDigestSet := make(map[string]struct{})
+		if repoDigests, exists := repoDigestMap[repoName]; exists {
+			candidateDigestSet = repoDigests
+			fmt.Printf("Repository %s: Found %d candidate digests in whitelist\n", repoName, len(candidateDigestSet))
+		} else {
+			fmt.Printf("Repository %s: No candidate digests found in whitelist - no tags will be deleted\n", repoName)
+		}
+
 		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked, candidateDigestSet, deniedTagSet, enableBackup, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup)
 		if err != nil {
 			return deletedTagsCount, deletedManifestsCount, fmt.Errorf("failed to purge tags: %w", err)
@@ -283,6 +292,7 @@ func purge(ctx context.Context,
 }
 
 // loadCSVValues reads a file line by line, skipping the first line (header) and empty lines, removing surrounding quotes.
+// Used for loading denied tags list (simple single-column format)
 func loadCSVValues(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -302,8 +312,9 @@ func loadCSVValues(path string) ([]string, error) {
 			continue
 		}
 
+		// Remove surrounding quotes
 		line = strings.TrimFunc(line, func(r rune) bool {
-			return r == '"' || r == '\''
+			return r == '"' || r == '\'' || r == '\t'
 		})
 
 		if line != "" {
@@ -311,6 +322,51 @@ func loadCSVValues(path string) ([]string, error) {
 		}
 	}
 	return out, scanner.Err()
+}
+
+// loadRepoDigestMapping reads the candidate CSV file and returns a mapping of repo -> set of digests
+func loadRepoDigestMapping(path string) (map[string]map[string]struct{}, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	repoDigestMap := make(map[string]map[string]struct{})
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip first line (header) and empty lines
+		if lineNum == 1 || line == "" {
+			continue
+		}
+
+		// Parse repo,digest format
+		parts := strings.Split(line, ",")
+		if len(parts) >= 2 {
+			repo := strings.TrimSpace(parts[0])
+			digest := strings.TrimSpace(parts[1])
+
+			// Remove surrounding quotes
+			repo = strings.TrimFunc(repo, func(r rune) bool {
+				return r == '"' || r == '\'' || r == '\t'
+			})
+			digest = strings.TrimFunc(digest, func(r rune) bool {
+				return r == '"' || r == '\'' || r == '\t'
+			})
+
+			if repo != "" && digest != "" {
+				if repoDigestMap[repo] == nil {
+					repoDigestMap[repo] = make(map[string]struct{})
+				}
+				repoDigestMap[repo][strings.ToLower(digest)] = struct{}{}
+			}
+		}
+	}
+	return repoDigestMap, scanner.Err()
 }
 
 // purgeTags deletes all tags that are older than the ago value and that match the tagFilter string.
