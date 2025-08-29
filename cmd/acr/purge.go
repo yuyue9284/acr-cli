@@ -53,6 +53,12 @@ const (
 
   - Delete all tags that are older than 7 days in the example.azurecr.io registry inside all repositories, including locked manifests/tags
 	acr purge -r example --filter ".*:.*" --ago 7d --include-locked
+
+  - Delete all tags older than 7 days with backup to another registry before deletion (backup is enabled by default)
+	acr purge -r example --filter ".*:.*" --ago 7d --backup-registry backup-registry --backup-subscription <subscription-id> --backup-resource-group <resource-group>
+
+  - Delete all tags older than 7 days without backup
+	acr purge -r example --filter ".*:.*" --ago 7d --disable-backup
 	`
 	maxPoolSize = 32 // The max number of parallel delete requests recommended by ACR server
 	headerLink  = "Link"
@@ -86,6 +92,13 @@ type purgeParameters struct {
 	deniedTags        []string
 	candidateListFile string
 	deniedListFile    string
+	// Backup-related parameters
+	disableBackup        bool
+	backupRegistryName   string
+	backupSubscriptionID string
+	backupResourceGroup  string
+	sourceSubscriptionID string
+	sourceResourceGroup  string
 }
 
 // newPurgeCmd defines the purge command.
@@ -135,6 +148,25 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 			purgeParams.candidateDigests = candidates
 			purgeParams.deniedTags = denied
 
+			// Validate backup parameters if backup is enabled (not disabled)
+			if !purgeParams.disableBackup {
+				if purgeParams.backupRegistryName == "" {
+					return errors.New("--backup-registry is required when backup is enabled (use --disable-backup to disable)")
+				}
+				if purgeParams.backupSubscriptionID == "" {
+					return errors.New("--backup-subscription is required when backup is enabled (use --disable-backup to disable)")
+				}
+				if purgeParams.backupResourceGroup == "" {
+					return errors.New("--backup-resource-group is required when backup is enabled (use --disable-backup to disable)")
+				}
+				if purgeParams.sourceSubscriptionID == "" {
+					return errors.New("--source-subscription is required when backup is enabled (use --disable-backup to disable)")
+				}
+				if purgeParams.sourceResourceGroup == "" {
+					return errors.New("--source-resource-group is required when backup is enabled (use --disable-backup to disable)")
+				}
+			}
+
 			// A clarification message for --dry-run.
 			if purgeParams.dryRun {
 				fmt.Println("DRY RUN: The following output shows what WOULD be deleted if the purge command was executed. Nothing is deleted.")
@@ -151,7 +183,7 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 				fmt.Printf("Specified concurrency value too large. Set to maximum value: %d \n", maxPoolSize)
 			}
 
-			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked, purgeParams.candidateDigests, purgeParams.deniedTags)
+			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked, purgeParams.candidateDigests, purgeParams.deniedTags, !purgeParams.disableBackup, purgeParams.backupRegistryName, purgeParams.backupSubscriptionID, purgeParams.backupResourceGroup, purgeParams.sourceSubscriptionID, purgeParams.sourceResourceGroup)
 
 			if err != nil {
 				fmt.Printf("Failed to complete purge: %v \n", err)
@@ -182,6 +214,13 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 	cmd.Flags().Int32Var(&purgeParams.repoPageSize, "repository-page-size", defaultRepoPageSize, repoPageSizeDescription)
 	cmd.Flags().StringVar(&purgeParams.candidateListFile, "candidate-digests", "", "REQUIRED. Path to CSV file listing manifest digests considered for deletion (candidate digest list). A tag whose digest is absent will NOT be deleted.")
 	cmd.Flags().StringVar(&purgeParams.deniedListFile, "denied-tags", "", "REQUIRED. Path to CSV file listing tag names that must never be deleted (denied tag list). One or more tag names per line or comma-separated; lines starting with # ignored.")
+	// Backup flags
+	cmd.Flags().BoolVar(&purgeParams.disableBackup, "disable-backup", false, "Disable backup of tags to another Azure Container Registry before deletion (backup is enabled by default)")
+	cmd.Flags().StringVar(&purgeParams.backupRegistryName, "backup-registry", "", "Name of the backup Azure Container Registry (required unless --disable-backup is set)")
+	cmd.Flags().StringVar(&purgeParams.backupSubscriptionID, "backup-subscription", "", "Azure subscription ID containing the backup registry (required unless --disable-backup is set)")
+	cmd.Flags().StringVar(&purgeParams.backupResourceGroup, "backup-resource-group", "", "Azure resource group containing the backup registry (required unless --disable-backup is set)")
+	cmd.Flags().StringVar(&purgeParams.sourceSubscriptionID, "source-subscription", "", "Azure subscription ID containing the source registry (required unless --disable-backup is set)")
+	cmd.Flags().StringVar(&purgeParams.sourceResourceGroup, "source-resource-group", "", "Azure resource group containing the source registry (required unless --disable-backup is set)")
 	cmd.Flags().BoolP("help", "h", false, "Print usage")
 	_ = cmd.MarkFlagRequired("filter")
 	_ = cmd.MarkFlagRequired("ago")
@@ -202,7 +241,13 @@ func purge(ctx context.Context,
 	dryRun bool,
 	includeLocked bool,
 	candidateDigests []string,
-	deniedTags []string) (deletedTagsCount int, deletedManifestsCount int, err error) {
+	deniedTags []string,
+	enableBackup bool,
+	backupRegistryName string,
+	backupSubscriptionID string,
+	backupResourceGroup string,
+	sourceSubscriptionID string,
+	sourceResourceGroup string) (deletedTagsCount int, deletedManifestsCount int, err error) {
 
 	// Pre-build lookup sets for efficiency
 	candidateDigestSet := make(map[string]struct{})
@@ -216,7 +261,7 @@ func purge(ctx context.Context,
 
 	// In order to print a summary of the deleted tags/manifests the counters get updated everytime a repo is purged.
 	for repoName, tagRegex := range tagFilters {
-		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked, candidateDigestSet, deniedTagSet)
+		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked, candidateDigestSet, deniedTagSet, enableBackup, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup)
 		if err != nil {
 			return deletedTagsCount, deletedManifestsCount, fmt.Errorf("failed to purge tags: %w", err)
 		}
@@ -270,7 +315,7 @@ func loadCSVValues(path string) ([]string, error) {
 
 // purgeTags deletes all tags that are older than the ago value and that match the tagFilter string.
 // candidateDigestSet contains allowed digests (lowercased), deniedTagSet contains tag names to skip.
-func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoParallelism int, loginURL string, repoName string, ago string, tagFilter string, keep int, regexpMatchTimeoutSeconds int64, dryRun bool, includeLocked bool, candidateDigestSet map[string]struct{}, deniedTagSet map[string]struct{}) (int, map[string]int, error) {
+func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoParallelism int, loginURL string, repoName string, ago string, tagFilter string, keep int, regexpMatchTimeoutSeconds int64, dryRun bool, includeLocked bool, candidateDigestSet map[string]struct{}, deniedTagSet map[string]struct{}, enableBackup bool, backupRegistryName string, backupSubscriptionID string, backupResourceGroup string, sourceSubscriptionID string, sourceResourceGroup string) (int, map[string]int, error) {
 	if dryRun {
 		fmt.Printf("Would delete tags for repository: %s\n", repoName)
 	} else {
@@ -309,6 +354,14 @@ func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoPar
 				manifestToTagsCountMap[*tag.Digest]++
 				if dryRun {
 					fmt.Printf("Would delete: %s/%s:%s\n", loginURL, repoName, *tag.Name)
+				}
+			}
+
+			// Backup tags before deletion if backup is enabled
+			if enableBackup {
+				err := backupTagsToACR(ctx, loginURL, tagsToDelete, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup, repoName)
+				if err != nil {
+					return -1, manifestToTagsCountMap, fmt.Errorf("failed to backup tags: %w", err)
 				}
 			}
 
