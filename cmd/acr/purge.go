@@ -4,9 +4,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -70,15 +73,19 @@ const (
 // purgeParameters defines the parameters that the purge command uses (including the registry name, username and password).
 type purgeParameters struct {
 	*rootParameters
-	ago           string
-	keep          int
-	filters       []string
-	filterTimeout int64
-	untagged      bool
-	dryRun        bool
-	includeLocked bool
-	concurrency   int
-	repoPageSize  int32
+	ago               string
+	keep              int
+	filters           []string
+	filterTimeout     int64
+	untagged          bool
+	dryRun            bool
+	includeLocked     bool
+	concurrency       int
+	repoPageSize      int32
+	candidateDigests  []string
+	deniedTags        []string
+	candidateListFile string
+	deniedListFile    string
 }
 
 // newPurgeCmd defines the purge command.
@@ -107,6 +114,27 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Load candidate / denied lists from CSV files before proceeding
+			if purgeParams.candidateListFile == "" || purgeParams.deniedListFile == "" {
+				return errors.New("both --candidate-digests and --denied-tags must be provided")
+			}
+			candidates, err := loadCSVValues(purgeParams.candidateListFile)
+			if err != nil {
+				return fmt.Errorf("failed reading candidate-digests CSV: %w", err)
+			}
+			if len(candidates) == 0 {
+				return errors.New("candidate-digests file is empty; aborting purge for safety")
+			}
+			denied, err := loadCSVValues(purgeParams.deniedListFile)
+			if err != nil {
+				return fmt.Errorf("failed reading denied-tags CSV: %w", err)
+			}
+			if len(denied) == 0 {
+				return errors.New("denied-tags file is empty; aborting purge for safety")
+			}
+			purgeParams.candidateDigests = candidates
+			purgeParams.deniedTags = denied
+
 			// A clarification message for --dry-run.
 			if purgeParams.dryRun {
 				fmt.Println("DRY RUN: The following output shows what WOULD be deleted if the purge command was executed. Nothing is deleted.")
@@ -123,7 +151,7 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 				fmt.Printf("Specified concurrency value too large. Set to maximum value: %d \n", maxPoolSize)
 			}
 
-			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked)
+			deletedTagsCount, deletedManifestsCount, err := purge(ctx, acrClient, loginURL, repoParallelism, purgeParams.ago, purgeParams.keep, purgeParams.filterTimeout, purgeParams.untagged, tagFilters, purgeParams.dryRun, purgeParams.includeLocked, purgeParams.candidateDigests, purgeParams.deniedTags)
 
 			if err != nil {
 				fmt.Printf("Failed to complete purge: %v \n", err)
@@ -143,18 +171,22 @@ func newPurgeCmd(rootParams *rootParameters) *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&purgeParams.untagged, "untagged", false, "If the untagged flag is set all the manifests that do not have any tags associated to them will be also purged, except if they belong to a manifest list that contains at least one tag")
-	cmd.Flags().BoolVar(&purgeParams.dryRun, "dry-run", false, "If the dry-run flag is set no manifest or tag will be deleted, the output would be the same as if they were deleted")
+	cmd.Flags().BoolVar(&purgeParams.dryRun, "dry-run", true, "If the dry-run flag is set no manifest or tag will be deleted, the output would be the same as if they were deleted")
 	cmd.Flags().BoolVar(&purgeParams.includeLocked, "include-locked", false, "If the include-locked flag is set, locked manifests and tags (where deleteEnabled or writeEnabled is false) will be unlocked before deletion")
 	cmd.Flags().StringVar(&purgeParams.ago, "ago", "", "The tags that were last updated before this duration will be deleted, the format is [number]d[string] where the first number represents an amount of days and the string is in a Go duration format (e.g. 2d3h6m selects images older than 2 days, 3 hours and 6 minutes)")
-	cmd.Flags().IntVar(&purgeParams.keep, "keep", 0, "Number of latest to-be-deleted tags to keep, use this when you want to keep at least x number of latest tags that could be deleted meeting all other filter criteria")
+	cmd.Flags().IntVar(&purgeParams.keep, "keep", 10, "Number of latest to-be-deleted tags to keep, use this when you want to keep at least x number of latest tags that could be deleted meeting all other filter criteria")
 	cmd.Flags().StringArrayVarP(&purgeParams.filters, "filter", "f", nil, "Specify the repository and a regular expression filter for the tag name, if a tag matches the filter and is older than the duration specified in ago it will be deleted. Note: If backtracking is used in the regexp it's possible for the expression to run into an infinite loop. The default timeout is set to 1 minute for evaluation of any filter expression. Use the '--filter-timeout-seconds' option to set a different value.")
 	cmd.Flags().StringArrayVarP(&purgeParams.configs, "config", "c", nil, "Authentication config paths (e.g. C://Users/docker/config.json)")
 	cmd.Flags().Int64Var(&purgeParams.filterTimeout, "filter-timeout-seconds", defaultRegexpMatchTimeoutSeconds, "This limits the evaluation of the regex filter, and will return a timeout error if this duration is exceeded during a single evaluation. If written incorrectly a regexp filter with backtracking can result in an infinite loop.")
 	cmd.Flags().IntVar(&purgeParams.concurrency, "concurrency", defaultPoolSize, concurrencyDescription)
 	cmd.Flags().Int32Var(&purgeParams.repoPageSize, "repository-page-size", defaultRepoPageSize, repoPageSizeDescription)
+	cmd.Flags().StringVar(&purgeParams.candidateListFile, "candidate-digests", "", "REQUIRED. Path to CSV file listing manifest digests considered for deletion (candidate digest list). A tag whose digest is absent will NOT be deleted.")
+	cmd.Flags().StringVar(&purgeParams.deniedListFile, "denied-tags", "", "REQUIRED. Path to CSV file listing tag names that must never be deleted (denied tag list). One or more tag names per line or comma-separated; lines starting with # ignored.")
 	cmd.Flags().BoolP("help", "h", false, "Print usage")
 	_ = cmd.MarkFlagRequired("filter")
 	_ = cmd.MarkFlagRequired("ago")
+	_ = cmd.MarkFlagRequired("candidate-digests")
+	_ = cmd.MarkFlagRequired("denied-tags")
 	return cmd
 }
 
@@ -168,11 +200,23 @@ func purge(ctx context.Context,
 	removeUtaggedManifests bool,
 	tagFilters map[string]string,
 	dryRun bool,
-	includeLocked bool) (deletedTagsCount int, deletedManifestsCount int, err error) {
+	includeLocked bool,
+	candidateDigests []string,
+	deniedTags []string) (deletedTagsCount int, deletedManifestsCount int, err error) {
+
+	// Pre-build lookup sets for efficiency
+	candidateDigestSet := make(map[string]struct{})
+	for _, digest := range candidateDigests {
+		candidateDigestSet[strings.ToLower(strings.TrimSpace(digest))] = struct{}{}
+	}
+	deniedTagSet := make(map[string]struct{})
+	for _, tag := range deniedTags {
+		deniedTagSet[tag] = struct{}{}
+	}
 
 	// In order to print a summary of the deleted tags/manifests the counters get updated everytime a repo is purged.
 	for repoName, tagRegex := range tagFilters {
-		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked)
+		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked, candidateDigestSet, deniedTagSet)
 		if err != nil {
 			return deletedTagsCount, deletedManifestsCount, fmt.Errorf("failed to purge tags: %w", err)
 		}
@@ -193,8 +237,40 @@ func purge(ctx context.Context,
 
 }
 
+// loadCSVValues reads a file line by line, skipping the first line (header) and empty lines, removing surrounding quotes.
+func loadCSVValues(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip first line (header) and empty lines
+		if lineNum == 1 || line == "" {
+			continue
+		}
+
+		line = strings.TrimFunc(line, func(r rune) bool {
+			return r == '"' || r == '\''
+		})
+
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out, scanner.Err()
+}
+
 // purgeTags deletes all tags that are older than the ago value and that match the tagFilter string.
-func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoParallelism int, loginURL string, repoName string, ago string, tagFilter string, keep int, regexpMatchTimeoutSeconds int64, dryRun bool, includeLocked bool) (int, map[string]int, error) {
+// candidateDigestSet contains allowed digests (lowercased), deniedTagSet contains tag names to skip.
+func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoParallelism int, loginURL string, repoName string, ago string, tagFilter string, keep int, regexpMatchTimeoutSeconds int64, dryRun bool, includeLocked bool, candidateDigestSet map[string]struct{}, deniedTagSet map[string]struct{}) (int, map[string]int, error) {
 	if dryRun {
 		fmt.Printf("Would delete tags for repository: %s\n", repoName)
 	} else {
@@ -222,7 +298,7 @@ func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoPar
 
 	// GetTagsToDelete will return an empty lastTag when there are no more tags.
 	for {
-		tagsToDelete, newLastTag, newSkippedTagsCount, err := getTagsToDelete(ctx, acrClient, repoName, tagRegex, timeToCompare, lastTag, keep, skippedTagsCount, includeLocked)
+		tagsToDelete, newLastTag, newSkippedTagsCount, err := getTagsToDelete(ctx, acrClient, repoName, tagRegex, timeToCompare, lastTag, keep, skippedTagsCount, includeLocked, candidateDigestSet, deniedTagSet)
 		if err != nil {
 			return -1, manifestToTagsCountMap, err
 		}
@@ -297,7 +373,9 @@ func getTagsToDelete(ctx context.Context,
 	lastTag string,
 	keep int,
 	skippedTagsCount int,
-	includeLocked bool) ([]acr.TagAttributesBase, string, int, error) {
+	includeLocked bool,
+	candidateDigestSet map[string]struct{},
+	deniedTagSet map[string]struct{}) ([]acr.TagAttributesBase, string, int, error) {
 
 	var matches bool
 	var lastUpdateTime time.Time
@@ -332,6 +410,21 @@ func getTagsToDelete(ctx context.Context,
 			// as a tag to delete. With --include-locked flag, locked tags are also eligible for deletion.
 			if lastUpdateTime.Before(timeToCompare) {
 				if includeLocked || (*(*tag.ChangeableAttributes).DeleteEnabled && *(*tag.ChangeableAttributes).WriteEnabled) {
+					// Enforce candidate / denied rules
+					// Skip if tag name explicitly denied
+					if _, denied := deniedTagSet[*tag.Name]; denied {
+						fmt.Printf("Skipping denied tag: %s:%s\n", repoName, *tag.Name)
+						continue
+					}
+					// Require digest to be whitelisted (case-insensitive) - if no digest present skip
+					if tag.Digest == nil {
+						fmt.Printf("Skipping untagged manifest: %s:%s\n", repoName, *tag.Name)
+						continue
+					}
+					if _, candidate := candidateDigestSet[strings.ToLower(*tag.Digest)]; !candidate {
+						fmt.Printf("Skipping non-candidate digest: %s:%s (%s)\n", repoName, *tag.Name, *tag.Digest)
+						continue
+					}
 					tagsEligibleForDeletion = append(tagsEligibleForDeletion, tag)
 				}
 			}
