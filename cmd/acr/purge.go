@@ -267,7 +267,8 @@ func purge(ctx context.Context,
 			candidateDigestSet = repoDigests
 			fmt.Printf("Repository %s: Found %d candidate digests in whitelist\n", repoName, len(candidateDigestSet))
 		} else {
-			fmt.Printf("Repository %s: No candidate digests found in whitelist - no tags will be deleted\n", repoName)
+			fmt.Printf("Repository %s: No candidate digests found in whitelist - no tags will be deleted, skip\n", repoName)
+			continue
 		}
 
 		singleDeletedTagsCount, manifestToTagsCountMap, err := purgeTags(ctx, acrClient, repoParallelism, loginURL, repoName, tagDeletionSince, tagRegex, tagsToKeep, filterTimeout, dryRun, includeLocked, candidateDigestSet, deniedTagSet, enableBackup, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup)
