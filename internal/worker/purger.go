@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/acr-cli/acr"
 	"github.com/Azure/acr-cli/internal/api"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerregistry/armcontainerregistry"
@@ -131,7 +133,9 @@ func (p *Purger) backupSingleTag(ctx context.Context, tag acr.TagAttributesBase)
 	}
 
 	// Wait for the import to complete
-	_, err = poller.PollUntilDone(ctx, nil)
+	_, err = poller.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
+		Frequency: 10 * time.Second,
+	})
 	if err != nil {
 		// Check if this is the "Unable to find manifest digest" error that should be ignored
 		if isManifestNotFoundError(err) {
