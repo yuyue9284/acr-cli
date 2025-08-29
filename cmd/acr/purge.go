@@ -339,7 +339,7 @@ func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoPar
 	skippedTagsCount := 0
 	deletedTagsCount := 0
 	// In order to only have a limited amount of http requests, a purger is used that will start goroutines to delete tags.
-	purger := worker.NewPurger(repoParallelism, acrClient, loginURL, repoName, includeLocked)
+	purger := worker.NewPurger(repoParallelism, acrClient, loginURL, repoName, includeLocked, enableBackup, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup)
 
 	// GetTagsToDelete will return an empty lastTag when there are no more tags.
 	for {
@@ -354,14 +354,6 @@ func purgeTags(ctx context.Context, acrClient api.AcrCLIClientInterface, repoPar
 				manifestToTagsCountMap[*tag.Digest]++
 				if dryRun {
 					fmt.Printf("Would delete: %s/%s:%s\n", loginURL, repoName, *tag.Name)
-				}
-			}
-
-			// Backup tags before deletion if backup is enabled
-			if enableBackup {
-				err := backupTagsToACR(ctx, loginURL, tagsToDelete, backupRegistryName, backupSubscriptionID, backupResourceGroup, sourceSubscriptionID, sourceResourceGroup, repoName)
-				if err != nil {
-					return -1, manifestToTagsCountMap, fmt.Errorf("failed to backup tags: %w", err)
 				}
 			}
 
@@ -530,7 +522,7 @@ func purgeDanglingManifests(ctx context.Context, acrClient api.AcrCLIClientInter
 		return len(manifestsToDelete), nil
 	}
 	// In order to only have a limited amount of http requests, a purger is used that will start goroutines to delete manifests.
-	purger := worker.NewPurger(repoParallelism, acrClient, loginURL, repoName, includeLocked)
+	purger := worker.NewPurger(repoParallelism, acrClient, loginURL, repoName, includeLocked, false, "", "", "", "", "")
 	deletedManifestsCount, purgeErr := purger.PurgeManifests(ctx, manifestsToDelete)
 	if purgeErr != nil {
 		return -1, purgeErr
