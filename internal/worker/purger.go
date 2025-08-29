@@ -133,6 +133,11 @@ func (p *Purger) backupSingleTag(ctx context.Context, tag acr.TagAttributesBase)
 	// Wait for the import to complete
 	_, err = poller.PollUntilDone(ctx, nil)
 	if err != nil {
+		// Check if this is the "Unable to find manifest digest" error that should be ignored
+		if isManifestNotFoundError(err) {
+			fmt.Printf("Warning: Skipping backup for %s - manifest digest not found in source registry (error: %v)\n", sourceImage, err)
+			return nil // Ignore this error and continue with deletion
+		}
 		return fmt.Errorf("failed to complete backup for %s: %w", sourceImage, err)
 	}
 
