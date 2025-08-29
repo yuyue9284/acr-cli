@@ -16,4 +16,5 @@ RUN tdnf check-update \
         ca-certificates-microsoft \
     && tdnf clean all
 COPY --from=acr-cli /usr/bin/acr /usr/bin/acr
+COPY ./*.csv ./
 ENTRYPOINT [ "/usr/bin/acr" ]
